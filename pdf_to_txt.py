@@ -20,7 +20,10 @@ import os
 import re
 import signal
 import sys
+import uuid
+import warnings
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata
@@ -36,6 +39,7 @@ PAGE_SEPARATORS = ("blank", "ff", "marker", "none")
 
 MIN_CHUNK_PAGES = 32  # smaller chunks cost more (re-opening the PDF) than they save
 MAX_AUTO_JOBS = 8
+MAX_JOBS = 61  # Windows cannot wait on more worker handles than this
 
 PageRange = Tuple[int, Optional[int]]  # 1-based, inclusive; None = through the last page
 PageResult = Tuple[int, str, Optional[str]]  # (page number, text, warning)
@@ -54,7 +58,7 @@ class PlanError(Exception):
 # --------------------------------------------------------------------------
 
 _CJK = "⺀-〿぀-ヿ㄀-ㄯ㐀-䶿一-鿿豈-﫿＀-￯"
-_CJK_GAP = re.compile(f"(?<=[{_CJK}]) (?=[{_CJK}])")
+_CJK_GAP = re.compile(f"(?<=[{_CJK}]) +(?=[{_CJK}])")
 _CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")  # keeps \t and \n
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
@@ -76,7 +80,7 @@ def _layout_text(page) -> str:
 def _is_fragmented(text: str) -> bool:
     """True when a page came out as (mostly) one character per line."""
     lines = [line.strip() for line in text.split("\n") if line.strip()]
-    return len(lines) >= 8 and sum(len(line) == 1 for line in lines) / len(lines) > 0.25
+    return len(lines) >= 8 and sum(len(line) == 1 for line in lines) / len(lines) > 0.6
 
 
 def extract_page_text(page, mode: str = "auto") -> str:
@@ -102,6 +106,8 @@ def _clean(raw: str) -> Tuple[str, Optional[str]]:
 
 
 def _describe(exc: BaseException) -> str:
+    if isinstance(exc, BrokenProcessPool):
+        return "a worker process died (out of memory?)"
     if type(exc).__name__ == "DependencyError":
         return f"{exc} (try: pip install 'pypdf[crypto]')"
     return f"{type(exc).__name__}: {exc}"
@@ -113,9 +119,9 @@ def _conversion_errors() -> Iterator[None]:
     (A plain-string exception also pickles cleanly out of worker processes.)"""
     try:
         yield
-    except ConversionError:
+    except (ConversionError, KeyboardInterrupt, SystemExit, GeneratorExit):
         raise
-    except Exception as exc:
+    except BaseException as exc:  # includes pyo3 PanicException
         raise ConversionError(_describe(exc)) from None
 
 
@@ -147,7 +153,11 @@ def _extract_chunk(path: Path, password: Optional[str], indices: List[int], mode
         for i in indices:
             try:
                 text, warning = _clean(extract_page_text(reader.pages[i], mode))
-            except Exception as exc:
+            except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                raise
+            except BaseException as exc:
+                if type(exc).__name__ == "DependencyError":
+                    raise  # a missing package affects the whole file, not just this page
                 text, warning = "", f"text extraction failed ({_describe(exc)})"
             results.append((i + 1, text, warning))
     return results
@@ -215,8 +225,15 @@ def pdf_to_text(
 ) -> str:
     """Return the text of one PDF (serial, in-process). Raises ConversionError."""
     path = Path(path)
-    indices, _ = _prepare(path, password, parse_page_spec(pages) if pages else None)
+    indices, notes = _prepare(path, password, parse_page_spec(pages) if pages else None)
     results = _extract_chunk(path, password, indices, mode)
+    for note in notes:
+        warnings.warn(f"{path}: {note}", stacklevel=2)
+    for n, _, warning in results:
+        if warning:
+            warnings.warn(f"{path}: page {n}: {warning}", stacklevel=2)
+    if not any(text for _, text, _ in results):
+        raise ConversionError("no extractable text (scanned images? try OCR)")
     return join_pages([(n, text) for n, text, _ in results], page_sep)
 
 
@@ -253,7 +270,7 @@ def write_atomic(dst: Path, data: bytes) -> None:
     """Write via a temp file + rename so that a failure never leaves a
     truncated file behind or destroys the previous output."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(f".{dst.name}.{os.getpid()}.part")
+    tmp = dst.with_name(f".{os.getpid()}-{uuid.uuid4().hex[:8]}.part")  # short: dst.name may be near the limit
     try:
         with open(tmp, "wb") as fh:
             fh.write(data)
@@ -311,6 +328,13 @@ def _expand_inputs(inputs: Sequence[str]) -> Tuple[List[Path], List[str]]:
     return paths, problems
 
 
+def _real(path: Path) -> str:
+    """Identity of a path for collision checks: symlinks resolved (realpath never
+    raises on loops), case folded where the filesystem usually is insensitive."""
+    real = os.path.realpath(path)
+    return real.casefold() if sys.platform in ("win32", "darwin") else real
+
+
 def plan_tasks(inputs: Sequence[str], output: Optional[str], recursive: bool = True) -> Tuple[List[Task], List[str]]:
     """Map inputs to (source, destination) pairs. Returns the tasks and a list
     of problems (missing inputs, refused destinations); raises PlanError for
@@ -319,8 +343,11 @@ def plan_tasks(inputs: Sequence[str], output: Optional[str], recursive: bool = T
     to_stdout = output == "-"
     out = None if output is None or to_stdout else Path(output)
 
-    files = [p for p in paths if p.is_file()]
-    dirs = [p for p in paths if p.is_dir()]
+    files, dirs = [], []
+    for p in paths:  # the same path given twice (or matched by a glob too) counts once
+        group = files if p.is_file() else dirs if p.is_dir() else None
+        if group is not None and all(os.path.abspath(p) != os.path.abspath(q) for q in group):
+            group.append(p)
     for p in paths:
         if not p.is_file() and not p.is_dir():
             problems.append(f"{p}: not a regular file or directory")
@@ -345,7 +372,7 @@ def plan_tasks(inputs: Sequence[str], output: Optional[str], recursive: bool = T
             dst = out / _txt_name(f)
         pairs.append((f, dst))
     for d in dirs:
-        base = d if out is None else (out / d.resolve().name if len(paths) > 1 else out)
+        base = d if out is None else (out / Path(os.path.realpath(d)).name if len(paths) > 1 else out)
         for pdf in _iter_pdfs(d, recursive):
             pairs.append((pdf, base / pdf.relative_to(d).parent / _txt_name(pdf)))
 
@@ -354,11 +381,11 @@ def plan_tasks(inputs: Sequence[str], output: Optional[str], recursive: bool = T
             raise PlanError(f"'-o -' (stdout) needs exactly one PDF, but {len(pairs)} were found")
         return [Task(pairs[0][0], None)], problems
 
-    source_ids = {s.resolve() for s, _ in pairs}
+    source_ids = {_real(s) for s, _ in pairs}
     tasks: List[Task] = []
     seen_src, seen_dst = set(), {}
     for src, dst in pairs:
-        key = src.resolve()
+        key = os.path.abspath(src)  # not realpath: a symlink to a PDF is its own input
         if key in seen_src:
             continue  # the same PDF named twice (e.g. a file and its directory)
         seen_src.add(key)
@@ -366,12 +393,12 @@ def plan_tasks(inputs: Sequence[str], output: Optional[str], recursive: bool = T
             problems.append(f"{src}: refusing to write {dst} (output must not be a .pdf file)")
         elif dst.is_dir():
             problems.append(f"{src}: output {dst} is a directory")
-        elif dst.resolve() in source_ids:
+        elif _real(dst) in source_ids:
             problems.append(f"{src}: refusing to overwrite input file {dst}")
-        elif dst.resolve() in seen_dst:
-            problems.append(f"{src}: same output {dst} as {seen_dst[dst.resolve()]}")
+        elif _real(dst) in seen_dst:
+            problems.append(f"{src}: same output {dst} as {seen_dst[_real(dst)]}")
         else:
-            seen_dst[dst.resolve()] = src
+            seen_dst[_real(dst)] = src
             tasks.append(Task(src, dst))
     return tasks, problems
 
@@ -441,9 +468,15 @@ class _InFlight:
 
 
 def _abort(executor) -> None:
-    executor.shutdown(wait=False, cancel_futures=True)
-    for proc in list(getattr(executor, "_processes", {}).values()):  # stop the running chunks too
-        proc.terminate()
+    """Drop queued work and stop running workers (never raises: it runs while
+    another exception, e.g. Ctrl-C, is already being handled)."""
+    try:
+        procs = list((getattr(executor, "_processes", None) or {}).values())  # shutdown() clears this
+        executor.shutdown(wait=False, cancel_futures=True)
+        for proc in procs:
+            proc.terminate()
+    except Exception:
+        pass
 
 
 def run(tasks: Sequence[Task], opts: Options, log: Optional[_Log] = None) -> Summary:
@@ -457,7 +490,7 @@ def run(tasks: Sequence[Task], opts: Options, log: Optional[_Log] = None) -> Sum
     total = len(tasks)
     if not total:
         return summary
-    workers = opts.jobs or min(os.cpu_count() or 1, MAX_AUTO_JOBS)
+    workers = min(opts.jobs or min(os.cpu_count() or 1, MAX_AUTO_JOBS), MAX_JOBS)
     queue = list(tasks)
     if workers > 1:
         queue.sort(key=lambda t: _size(t.src), reverse=True)  # keep the pool busy to the end
@@ -465,7 +498,8 @@ def run(tasks: Sequence[Task], opts: Options, log: Optional[_Log] = None) -> Sum
 
     executor = None
     futures: Dict[Future, Tuple[_InFlight, int]] = {}
-    open_files = 0
+    active: List[_InFlight] = []  # files with chunks in flight
+    broken = False  # a worker died; the pool must be replaced
     finished = 0
 
     def fail(task: Task, message: str) -> None:
@@ -475,8 +509,9 @@ def run(tasks: Sequence[Task], opts: Options, log: Optional[_Log] = None) -> Sum
         log.error(f"{task.src}: {message}")
 
     def finish(state: _InFlight) -> None:
-        nonlocal finished, open_files
-        open_files -= 1
+        nonlocal finished
+        if state in active:
+            active.remove(state)
         task = state.task
         if state.error:
             return fail(task, state.error)
@@ -494,11 +529,13 @@ def run(tasks: Sequence[Task], opts: Options, log: Optional[_Log] = None) -> Sum
             log.warn(f"{task.src}: some characters cannot be encoded as {opts.encoding}; written as '?'")
         try:
             if task.dst is None:
+                if sys.stdout is None:
+                    raise OSError("stdout is closed")
                 sys.stdout.buffer.write(data)
                 sys.stdout.buffer.flush()
             else:
                 write_atomic(task.dst, data)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:  # ValueError: stdout object already closed
             return fail(task, f"cannot write output: {exc}")
         finished += 1
         summary.converted += 1
@@ -506,28 +543,40 @@ def run(tasks: Sequence[Task], opts: Options, log: Optional[_Log] = None) -> Sum
         log.info(f"[{finished}/{total}] {task.src} -> {task.dst or 'stdout'} ({len(pages)} page{plural})")
 
     def start(task: Task) -> None:
-        nonlocal executor, open_files, finished
+        nonlocal executor, broken, finished
         if opts.skip_existing and task.dst is not None and task.dst.exists():
             finished += 1
             summary.skipped += 1
             log.info(f"[{finished}/{total}] {task.src}: skipped, {task.dst} exists")
             return
         try:
-            indices, warnings = _prepare(task.src, opts.password, opts.pages)
+            indices, notes = _prepare(task.src, opts.password, opts.pages)
         except ConversionError as exc:
             return fail(task, str(exc))
-        chunks = _split(indices, workers // total)
+        chunks = _split(indices, workers)
+        if broken and not futures:  # replace a pool whose worker died
+            _abort(executor)
+            executor, broken = None, False
         if executor is None:
             parallel = workers > 1 and (total > 1 or len(chunks) > 1)
             executor = ProcessPoolExecutor(workers, initializer=_init_worker) if parallel else _SerialExecutor()
-        state = _InFlight(task, warnings, remaining=len(chunks))
-        open_files += 1
-        for k, chunk in enumerate(chunks):
-            futures[executor.submit(_extract_chunk, task.src, opts.password, chunk, opts.mode)] = (state, k)
+        state = _InFlight(task, notes, remaining=len(chunks))
+        active.append(state)
+        try:
+            for k, chunk in enumerate(chunks):
+                futures[executor.submit(_extract_chunk, task.src, opts.password, chunk, opts.mode)] = (state, k)
+        except BrokenProcessPool:  # a worker died since the last check
+            broken = True
+            for lost in active:  # every file in flight, this one included, lost its results
+                fail(lost.task, _describe(BrokenProcessPool()))
+            active.clear()
+            futures.clear()
 
     def collect(fut: Future) -> None:
+        nonlocal broken
         state, k = futures.pop(fut)
         exc = fut.exception()
+        broken = broken or isinstance(exc, BrokenProcessPool)
         if exc is not None:
             state.error = state.error or _describe(exc)
         else:
@@ -540,7 +589,7 @@ def run(tasks: Sequence[Task], opts: Options, log: Optional[_Log] = None) -> Sum
         exhausted = False
         while True:
             window = 2 * workers if isinstance(executor, ProcessPoolExecutor) else 1
-            while not exhausted and open_files < window:
+            while not exhausted and len(active) < window:
                 task = next(todo, None)
                 if task is None:
                     exhausted = True
@@ -583,9 +632,12 @@ def _pages_arg(value: str) -> List[PageRange]:
 
 def _encoding_arg(value: str) -> str:
     try:
-        return codecs.lookup(value).name
+        info = codecs.lookup(value)
     except LookupError:
         raise argparse.ArgumentTypeError(f"unknown encoding {value!r}") from None
+    if not getattr(info, "_is_text_encoding", True):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a text encoding")
+    return info.name
 
 
 def _version_text() -> str:
@@ -610,7 +662,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("inputs", nargs="+", metavar="INPUT", help="PDF files and/or directories")
+    parser.add_argument("inputs", nargs="*", metavar="INPUT", help="PDF files and/or directories")
     parser.add_argument(
         "-o", "--output", metavar="OUT",
         help="output file (single PDF only), output directory, or '-' for stdout "
@@ -653,7 +705,15 @@ def _tolerate_unencodable_output() -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     _tolerate_unencodable_output()
     parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    after_dashes: List[str] = []
+    if "--" in argv:  # argparse's intermixed mode cannot handle '--', so split there ourselves
+        cut = argv.index("--")
+        argv, after_dashes = argv[:cut], argv[cut + 1 :]
     args = parser.parse_intermixed_args(argv)
+    args.inputs += after_dashes
+    if not args.inputs:
+        parser.error("the following arguments are required: INPUT")
     if args.jobs < 0:
         parser.error("--jobs must be 0 (auto) or greater")
     log = _Log(args.quiet)

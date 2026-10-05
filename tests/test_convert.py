@@ -26,7 +26,7 @@ def test_single_file_writes_txt_next_to_pdf(make_pdf, capsys):
 def test_chinese_text_and_filename(make_pdf):
     pdf = make_pdf("報告.pdf", ["你好，世界", "繁體中文測試"], cjk=True)
     assert main([str(pdf)]) == 0
-    assert read(tmp := pdf.with_suffix(".txt")) == "你好，世界\n\n繁體中文測試\n", tmp
+    assert read(pdf.with_suffix(".txt")) == "你好，世界\n\n繁體中文測試\n"
 
 
 def test_library_api(make_pdf):
@@ -432,3 +432,198 @@ def test_script_runs_as_a_program(make_pdf, tmp_path):
     assert done.returncode == 0 and done.stdout == b"via subprocess\n"
     version = subprocess.run([sys.executable, str(script), "--version"], capture_output=True, text=True)
     assert version.stdout.startswith("pdf-to-txt " + m.__version__)
+
+
+# ---- regressions from the review ------------------------------------------
+
+
+def test_symlink_loop_at_destination_does_not_crash(make_pdf, tmp_path):
+    pdf = make_pdf("a.pdf")
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / "a.txt").symlink_to("a.txt")
+    assert main(["-q", str(pdf), "-o", str(out) + os.sep]) in (0, 1)  # an error message, never a traceback
+
+
+def test_output_guards_individually(make_pdf, tmp_path, capsys):
+    pdf = make_pdf("a.pdf")
+    other = tmp_path / "other.pdf"
+    assert main([str(pdf), "-o", str(other)]) == 1
+    assert "output must not be a .pdf file" in capsys.readouterr().err
+    assert not other.exists()
+    data = make_pdf("scan.pdf").rename(tmp_path / "scan.dat")
+    assert main([str(data), "-o", str(data)]) == 1
+    assert "refusing to overwrite input file" in capsys.readouterr().err
+    assert data.read_bytes().startswith(b"%PDF")
+    (tmp_path / "out" / "a.txt").mkdir(parents=True)
+    assert main([str(pdf), "-o", str(tmp_path / "out")]) == 1
+    assert "is a directory" in capsys.readouterr().err
+
+
+def test_closed_stdout(make_pdf, monkeypatch, capsys):
+    pdf = make_pdf("a.pdf")
+    monkeypatch.setattr(sys, "stdout", None)
+    assert main(["-o", "-", str(pdf)]) == 1
+    assert "stdout is closed" in capsys.readouterr().err
+
+
+def test_long_file_names_can_be_written(make_pdf, tmp_path):
+    pdf = make_pdf("x" * 200 + ".pdf")
+    assert main(["-q", str(pdf), "-o", str(tmp_path / ("y" * 251 + ".txt"))]) == 0
+
+
+def test_duplicate_input_keeps_output_file_semantics(make_pdf, tmp_path):
+    pdf = make_pdf("a.pdf")
+    assert main(["-q", str(pdf), str(pdf), "-o", str(tmp_path / "out.txt")]) == 0
+    assert (tmp_path / "out.txt").is_file()
+
+
+def test_double_dash_allows_dash_names(make_pdf, tmp_path, monkeypatch):
+    make_pdf("-x.pdf")
+    monkeypatch.chdir(tmp_path)
+    assert main(["-q", "--", "-x.pdf"]) == 0
+    assert (tmp_path / "-x.txt").is_file()
+    with pytest.raises(SystemExit) as exc:
+        main([])
+    assert exc.value.code == 2
+
+
+def test_symlink_to_a_pdf_is_its_own_input(make_pdf, tmp_path):
+    pdf = make_pdf("a.pdf")
+    (tmp_path / "link.pdf").symlink_to(pdf)
+    assert main(["-q", str(pdf), str(tmp_path / "link.pdf")]) == 0
+    assert (tmp_path / "a.txt").is_file() and (tmp_path / "link.txt").is_file()
+
+
+def test_case_insensitive_collisions_on_mac_and_windows(make_pdf, tmp_path, monkeypatch, capsys):
+    make_pdf("a.pdf", parent=tmp_path / "x")
+    make_pdf("A.PDF", parent=tmp_path / "y")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert main(["-q", str(tmp_path / "x" / "a.pdf"), str(tmp_path / "y" / "A.PDF"), "-o", str(tmp_path / "o")]) == 1
+    assert "same output" in capsys.readouterr().err
+
+
+def test_page_clipping_warning(make_pdf, capsys):
+    pdf = make_pdf("a.pdf", ["one", "two"])
+    assert main(["-p", "1-9", str(pdf)]) == 0
+    assert "pages beyond that were ignored" in capsys.readouterr().err
+
+
+def test_pypdf_unusable_and_bad_jobs(make_pdf, monkeypatch, capsys):
+    pdf = make_pdf("a.pdf")
+
+    class Panic(BaseException):
+        pass
+
+    for exc in (ImportError("no pypdf"), Panic("boom")):
+        def broken(exc=exc):
+            raise exc
+
+        monkeypatch.setattr(m, "_load_pypdf", broken)
+        assert main([str(pdf)]) == 3
+        assert "pip install" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as exc_info:
+        main(["-j", "-1", str(pdf)])
+    assert exc_info.value.code == 2
+    with pytest.raises(SystemExit):
+        main(["-e", "rot13", str(pdf)])
+
+
+def test_missing_dependency_is_not_reported_as_scanned(make_pdf, monkeypatch, capsys):
+    pdf = make_pdf("a.pdf")
+
+    class DependencyError(Exception):
+        pass
+
+    def no_crypto(page, mode="auto"):
+        raise DependencyError("cryptography>=3.1 is required for AES algorithm")
+
+    monkeypatch.setattr(m, "extract_page_text", no_crypto)
+    assert main(["-j", "1", str(pdf)]) == 1
+    err = capsys.readouterr().err
+    assert "pip install 'pypdf[crypto]'" in err and "OCR" not in err
+
+
+def test_base_exception_from_a_page_fails_only_that_file(make_pdf, tmp_path, monkeypatch, capsys):
+    class Panic(BaseException):
+        pass
+
+    real = m.extract_page_text
+
+    def panicky(page, mode="auto"):
+        text = real(page, mode)
+        if text.startswith("poison"):
+            raise Panic("rust panic")
+        return text
+
+    make_pdf("a.pdf", ["poison"], parent=tmp_path / "in")
+    make_pdf("b.pdf", ["fine"], parent=tmp_path / "in")
+    monkeypatch.setattr(m, "extract_page_text", panicky)
+    assert main(["-j", "1", str(tmp_path / "in")]) == 1
+    assert read(tmp_path / "in" / "b.txt") == "fine\n"
+
+
+def test_library_api_warns_and_raises(make_pdf):
+    pdf = make_pdf("a.pdf", ["one"])
+    with pytest.warns(UserWarning, match="beyond that were ignored"):
+        assert m.pdf_to_text(pdf, pages="1-5") == "one"
+    with pytest.raises(ConversionError, match="no extractable text"):
+        m.pdf_to_text(make_pdf("blank.pdf", [""]))
+
+
+def test_cjk_gap_removal_handles_runs_of_spaces():
+    assert m._CJK_GAP.sub("", "你  好   世 界 abc d") == "你好世界 abc d"
+
+
+def test_bullets_do_not_trigger_the_layout_fallback():
+    bullets = "\n".join(f"-\nitem number {i}" for i in range(6))  # 50% single-character lines
+    assert not m._is_fragmented(bullets)
+
+
+def test_split_sizes_when_not_divisible():
+    assert [len(c) for c in m._split(list(range(100)), 3)] == [34, 34, 32]
+
+
+def test_abort_survives_a_pool_that_already_cleared_its_processes():
+    class Proc:
+        terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    proc = Proc()
+
+    class Pool:
+        _processes = {1: proc}
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self._processes = None  # what CPython does
+
+    m._abort(Pool())
+    assert proc.terminated
+
+
+_real_extract_chunk = m._extract_chunk
+
+
+def _dying_extract_chunk(path, password, indices, mode):  # module level so the pool can pickle it
+    if Path(path).name == "f3.pdf":
+        os._exit(1)
+    return _real_extract_chunk(path, password, indices, mode)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs the fork start method")
+def test_worker_death_fails_files_without_a_traceback(make_pdf, tmp_path, monkeypatch, capsys):
+    import multiprocessing
+
+    if multiprocessing.get_start_method() != "fork":
+        pytest.skip("needs the fork start method")
+    for i in range(6):
+        make_pdf(f"f{i}.pdf", [f"file {i}"], parent=tmp_path / "in")
+    monkeypatch.setattr(m, "_extract_chunk", _dying_extract_chunk)
+    assert main(["-j", "2", str(tmp_path / "in")]) == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err and "worker process died" in err
+    done = err.split("Done: ")[1].split("\n")[0]
+    converted, failed = int(done.split()[0]), int(done.split("skipped, ")[1].split()[0])
+    assert converted + failed == 6 and failed >= 1
